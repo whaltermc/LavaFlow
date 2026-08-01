@@ -104,7 +104,22 @@ final class LavaFlowGpuSurface implements GpuSurfaceBackend {
                         capabilities.minImageExtent().height(), capabilities.maxImageExtent().height());
             }
 
-            destroySwapchain();
+            // Keep the old swapchain alive until after the new one is created so the
+            // presentation engine can hand off smoothly.  Destroying it first (and passing
+            // NULL as oldSwapchain) forces a momentary black frame on every resize/reconfigure.
+            long previousSwapchain = swapchain;
+            if (previousSwapchain != NULL) {
+                // Wait for all in-flight work referencing the old images to finish before we
+                // retire those images, then release the per-image present semaphores.
+                vkDeviceWaitIdle(context.device());
+                for (long semaphore : presentSemaphores)
+                    if (semaphore != NULL) vkDestroySemaphore(context.device(), semaphore, null);
+            }
+            swapchain = NULL;
+            images = new long[0];
+            imageLayouts = new int[0];
+            presentSemaphores = new long[0];
+            currentImage = NO_IMAGE;
 
             int[] format = chooseSurfaceFormat(stack);
             int imageCount = Math.max(3, capabilities.minImageCount());
@@ -118,7 +133,7 @@ final class LavaFlowGpuSurface implements GpuSurfaceBackend {
                     .imageArrayLayers(1).imageUsage(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                     .preTransform(capabilities.currentTransform())
                     .compositeAlpha(chooseCompositeAlpha(capabilities.supportedCompositeAlpha()))
-                    .presentMode(presentMode).clipped(true).oldSwapchain(NULL);
+                    .presentMode(presentMode).clipped(true).oldSwapchain(previousSwapchain);
             if (context.graphicsFamily() == context.presentFamily()) {
                 info.imageSharingMode(VK_SHARING_MODE_EXCLUSIVE);
             } else {
@@ -129,6 +144,12 @@ final class LavaFlowGpuSurface implements GpuSurfaceBackend {
             LongBuffer out = stack.mallocLong(1);
             check(vkCreateSwapchainKHR(context.device(), info, null, out), "vkCreateSwapchainKHR");
             swapchain = out.get(0);
+
+            // Old swapchain is now retired; destroy it now that the new one is live.
+            if (previousSwapchain != NULL) {
+                vkDestroySwapchainKHR(context.device(), previousSwapchain, null);
+            }
+
             IntBuffer count = stack.ints(0);
             check(vkGetSwapchainImagesKHR(context.device(), swapchain, count, null),
                     "vkGetSwapchainImagesKHR(count)");
@@ -236,7 +257,16 @@ final class LavaFlowGpuSurface implements GpuSurfaceBackend {
                     .image(destination).srcAccessMask(0).dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
             toTransfer.subresourceRange().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1)
                     .baseArrayLayer(0).layerCount(1);
-            vkCmdPipelineBarrier(encoder.commandBuffer(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            // When the image was previously presented (PRESENT_SRC_KHR), use
+            // COLOR_ATTACHMENT_OUTPUT_BIT as the source stage.  This matches the stage at
+            // which the acquire semaphore is waited (see LavaFlowCommandEncoder.submit) and
+            // forces Mali's TBDR to flush its L1 tile cache before the blit begins.
+            // TOP_OF_PIPE_BIT is sufficient only for the very first use (UNDEFINED layout)
+            // where there is no prior GPU work referencing the image.
+            int toTransferSrcStage = (imageLayouts[currentImage] == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+                    ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                    : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            vkCmdPipelineBarrier(encoder.commandBuffer(), toTransferSrcStage,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, null, null, toTransfer);
 
             VkImageBlit.Buffer blit = VkImageBlit.calloc(1, stack);

@@ -128,7 +128,10 @@ final class LavaFlowCommandEncoder implements CommandEncoderBackend {
             VkSubmitInfo submit = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(commandBuffer));
             if (waitSemaphore != NULL) {
                 submit.waitSemaphoreCount(1).pWaitSemaphores(stack.longs(waitSemaphore));
-                submit.pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_TRANSFER_BIT));
+                // Mali GPU (TBDR) requires the acquire semaphore to be waited at
+                // COLOR_ATTACHMENT_OUTPUT_BIT. Waiting only at TRANSFER_BIT leaves Mali's
+                // tile buffer unflushed from prior frame work, causing flickering.
+                submit.pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT));
             }
             if (signalSemaphore != NULL) submit.pSignalSemaphores(stack.longs(signalSemaphore));
             check(vkQueueSubmit(context.graphicsQueue(), submit, slot.fence), "vkQueueSubmit");
